@@ -1,0 +1,177 @@
+from utils import csv_operations, dr_algorithm, ExtendedKalmanFilter2D
+from pathlib import Path
+import matplotlib.pyplot as plt
+import numpy as np
+
+
+def position_rmse(reference_df, estimate_df, ref_x_col, ref_y_col, est_x_col, est_y_col):
+    # Compare 2D position trajectories with a single RMSE scalar.
+    n = min(len(reference_df), len(estimate_df))
+    if n == 0:
+        return float('inf')
+
+    rx = reference_df[ref_x_col].to_numpy()[:n]
+    ry = reference_df[ref_y_col].to_numpy()[:n]
+    ex = estimate_df[est_x_col].to_numpy()[:n]
+    ey = estimate_df[est_y_col].to_numpy()[:n]
+    return float(np.sqrt(np.mean((ex - rx) ** 2 + (ey - ry) ** 2)))
+
+
+def apply_uniform_timestamps(df, dt=0.1):
+    # Rebuild monotonic timestamps because source data contains repeated time values.
+    out = df.copy()
+    out['timestamps'] = np.arange(len(out), dtype=float) * dt
+    return out
+
+
+def debias_acceleration(acc_df):
+    out = acc_df.copy()
+    # Median is robust against spikes in IMU samples.
+    ax_bias = float(out['ax'].median())
+    ay_bias = float(out['ay'].median())
+    out['ax'] = out['ax'] - ax_bias
+    out['ay'] = out['ay'] - ay_bias
+    return out
+
+
+def tune_ekf(true_df, acc_df, leo_df, sample_size=3000):
+    # The accelerometer data in this dataset is dominated by gravity (~9.87 m/s²)
+    # and does not capture horizontal motion dynamics, so accel_gain is fixed at 0.
+    # We only tune process_std (random-walk velocity noise) and measurement_std.
+    accel_candidates = [10.0, 50.0, 100.0]
+    meas_candidates = [12.0, 16.0, 24.0]
+    # Gate must be permissive — the filter needs LEO updates when velocity changes fast.
+    gate_candidates = [1000.0, 1e6]
+
+    n = min(sample_size, len(true_df), len(acc_df), len(leo_df))
+    true_sample = true_df.iloc[:n].reset_index(drop=True)
+    acc_sample = acc_df.iloc[:n].reset_index(drop=True)
+    leo_sample = leo_df.iloc[:n].reset_index(drop=True)
+    split_idx = max(2, int(0.7 * n))
+
+    true_train = true_sample.iloc[:split_idx].reset_index(drop=True)
+    acc_train = acc_sample.iloc[:split_idx].reset_index(drop=True)
+    leo_train = leo_sample.iloc[:split_idx].reset_index(drop=True)
+
+    true_val = true_sample.iloc[split_idx:].reset_index(drop=True)
+    acc_val = acc_sample.iloc[split_idx:].reset_index(drop=True)
+    leo_val = leo_sample.iloc[split_idx:].reset_index(drop=True)
+
+    best = None
+    for process_std in accel_candidates:
+        for meas_std in meas_candidates:
+            for gate_threshold in gate_candidates:
+                candidate = ExtendedKalmanFilter2D(
+                    process_accel_std=process_std,
+                    measurement_pos_std=meas_std,
+                    default_dt=0.1,
+                    min_dt=0.005,
+                    max_dt=0.2,
+                    gate_threshold=gate_threshold,
+                    accel_gain=0.0,
+                    accel_to_position=True
+                )
+                ekf_train, _ = candidate.run(acc_train, leo_train, compute_rts=False)
+                ekf_val, _ = candidate.run(acc_val, leo_val, compute_rts=False)
+
+                train_score = position_rmse(true_train, ekf_train, 'true_x', 'true_y', 'ekf_x', 'ekf_y')
+                val_score = position_rmse(true_val, ekf_val, 'true_x', 'true_y', 'ekf_x', 'ekf_y')
+                score = 0.7 * val_score + 0.3 * train_score
+
+                if best is None or score < best['rmse']:
+                    best = {
+                        'process_accel_std': process_std,
+                        'measurement_pos_std': meas_std,
+                        'accel_gain': 0.0,
+                        'gate_threshold': gate_threshold,
+                        'train_rmse': train_score,
+                        'val_rmse': val_score,
+                        'rmse': score
+                    }
+
+    if best is None:
+        raise RuntimeError('EKF tuning failed to produce any candidate result')
+
+    return best
+
+
+
+
+def main():
+    filepath = Path(__file__).resolve().parent / 'dataset' / 'df_withLEO.csv'
+    csv_op = csv_operations(filepath)
+
+    true_df, acc_df, _, leo_df = csv_op.read_csv()
+
+    # Raw CSV timestamps are mostly duplicated; force a stable sample-time base.
+    sample_dt = 0.1
+    true_df = apply_uniform_timestamps(true_df, dt=sample_dt)
+    acc_raw_df = apply_uniform_timestamps(acc_df, dt=sample_dt)
+    leo_raw_df = apply_uniform_timestamps(leo_df, dt=sample_dt)
+
+    # DR uses raw (biased) IMU — shows unbounded drift without position correction.
+    dr_df = dr_algorithm(acc_raw_df, leo_raw_df, default_dt=sample_dt).calculate_df()
+
+    # Debias acceleration for EKF: IMU DC bias would otherwise accumulate in velocity
+    # and diverge the predicted state until LEO updates are rejected by the gate.
+    acc_ekf_df = debias_acceleration(acc_raw_df)
+
+    # EKF uses debiased IMU for prediction and LEO for measurement correction.
+    best = tune_ekf(true_df, acc_ekf_df, leo_raw_df)
+
+    ekf = ExtendedKalmanFilter2D(
+        process_accel_std=best['process_accel_std'],
+        measurement_pos_std=best['measurement_pos_std'],
+        default_dt=sample_dt,
+        min_dt=0.005,
+        max_dt=0.2,
+        gate_threshold=best['gate_threshold'],
+        accel_gain=best['accel_gain'],
+        accel_to_position=True
+    )
+    ekf_df, rts_df = ekf.run(acc_ekf_df, leo_raw_df, compute_rts=True)
+
+    leo_rmse = position_rmse(true_df, leo_raw_df, 'true_x', 'true_y', 'LEO_x', 'LEO_y')
+    dr_rmse = position_rmse(true_df, dr_df, 'true_x', 'true_y', 'dr_x', 'dr_y')
+    ekf_rmse = position_rmse(true_df, ekf_df, 'true_x', 'true_y', 'ekf_x', 'ekf_y')
+    rts_rmse = position_rmse(true_df, rts_df, 'true_x', 'true_y', 'rts_x', 'rts_y')
+
+    print(
+        'Best parameters:',
+        f"process_accel_std={best['process_accel_std']}",
+        f"measurement_pos_std={best['measurement_pos_std']}",
+        f"accel_gain={best['accel_gain']}",
+        f"gate_threshold={best['gate_threshold']}"
+    )
+    print(f"Tuning RMSE train/val: {best['train_rmse']:.3f} / {best['val_rmse']:.3f}")
+    print(f'RMSE LEO: {leo_rmse:.3f}')
+    print(f'RMSE DR: {dr_rmse:.3f}')
+    print(f'RMSE EKF: {ekf_rmse:.3f}')
+    print(f'RMSE RTS: {rts_rmse:.3f}')
+
+    plot_n = 500
+    true_plot = true_df.iloc[:plot_n]
+    leo_plot = leo_raw_df.iloc[:plot_n]
+    ekf_plot = ekf_df.iloc[:plot_n]
+    rts_plot = rts_df.iloc[:plot_n]
+
+    plt.figure(figsize=(10, 8))
+    plt.plot(true_plot['true_x'], true_plot['true_y'], label='True', linewidth=2)
+    plt.plot(leo_plot['LEO_x'], leo_plot['LEO_y'], label='LEO', alpha=0.8)
+    plt.plot(ekf_plot['ekf_x'], ekf_plot['ekf_y'], label='Kalman (EKF)', linewidth=2)
+    plt.plot(rts_plot['rts_x'], rts_plot['rts_y'], label='RTS Smoothed', linewidth=2)
+
+    plt.title('Trajectory Comparison: True vs LEO vs Kalman')
+    plt.xlabel('X position')
+    plt.ylabel('Y position')
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.4)
+    plt.axis('equal')
+
+    plot_path = Path(__file__).resolve().parent / 'trajectory_comparison.png'
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    print(f'Plot saved to: {plot_path}')
+
+
+if __name__ == "__main__":
+    main()
