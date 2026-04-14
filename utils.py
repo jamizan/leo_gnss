@@ -1,3 +1,4 @@
+import csv
 import pandas as pd
 import numpy as np
 from typing import List, Tuple
@@ -15,57 +16,43 @@ class csv_operations:
 
     # Split the data into separate DataFrames
     def _split_data(self, df):
-        true_df = df[['timestamps', 'true_lat', 'true_lon', 'true_x', 'true_y']]
-        acc_df = df[['timestamps', 'ax', 'ay']]
-        gnss_df = df[['timestamps', 'gnss_lat', 'gnss_lon', 'gnss_x', 'gnss_y']]
-        leo_df = df[['timestamps', 'LEO_lat', 'LEO_lon', 'LEO_x', 'LEO_y']]
+        self.true_df = df[['timestamps', 'true_lat', 'true_lon', 'true_x', 'true_y']]
+        self.acc_df = df[['timestamps', 'ax', 'ay']]
+        self.gnss_df = df[['timestamps', 'gnss_lat', 'gnss_lon', 'gnss_x', 'gnss_y']]
+        self.leo_df = df[['timestamps', 'LEO_lat', 'LEO_lon', 'LEO_x', 'LEO_y']]
 
-        return true_df, acc_df, gnss_df, leo_df
+        return self.true_df, self.acc_df, self.gnss_df, self.leo_df
+    
+    def create_csv(self, ekf_df, rts_df, output_filename):
+        # Align rows by index to avoid NaN from timestamp outer joins.
+        n = min(200, len(self.true_df), len(self.leo_df), len(ekf_df), len(rts_df))
+
+        true_block = self.true_df[['timestamps', 'true_lat', 'true_lon', 'true_x', 'true_y']].iloc[:n].reset_index(drop=True)
+        leo_block = self.leo_df[['LEO_lat', 'LEO_lon', 'LEO_x', 'LEO_y']].iloc[:n].reset_index(drop=True)
+        ekf_block = ekf_df[['ekf_x', 'ekf_y', 'ekf_vx', 'ekf_vy']].iloc[:n].reset_index(drop=True)
+        rts_block = rts_df[['rts_x', 'rts_y', 'rts_vx', 'rts_vy']].iloc[:n].reset_index(drop=True)
+
+        combined_df = pd.concat([true_block, leo_block, ekf_block, rts_block], axis=1)
+        column_headers = combined_df.columns.tolist()
+        top_header = [
+            'TIMESTAMP', 'TRUE', '', '', '',
+            'LEO', '', '', '',
+            'EKF', '', '', '',
+            'RTS', '', '', ''
+        ]
+
+        # Semicolon keeps values in separate cells for Excel locales using comma decimals.
+        with open(output_filename, mode='w', newline='', encoding='utf-8') as csv_file:
+            writer = csv.writer(csv_file, delimiter=';')
+            writer.writerow(top_header)
+            writer.writerow(column_headers)
+            for row in combined_df.itertuples(index=False, name=None):
+                writer.writerow(row)
+
+        print(f'CSV file saved to: {output_filename}')
 
 
-class dr_algorithm:
-    def __init__(self, acc_df, leo_df, default_dt=0.1):
-        self.acc_df = acc_df[['timestamps', 'ax', 'ay']].reset_index(drop=True)
-        self.leo_df = leo_df[['timestamps', 'LEO_x', 'LEO_y']].reset_index(drop=True)
-        self.default_dt = float(default_dt)
 
-    def calculate_df(self):
-        if self.acc_df.empty or self.leo_df.empty:
-            return pd.DataFrame(columns=['timestamps', 'dr_x', 'dr_y'])
-
-        n = min(len(self.acc_df), len(self.leo_df))
-        dr_df = pd.DataFrame(index=range(n), columns=['timestamps', 'dr_x', 'dr_y'], dtype=float)
-
-        # Initialize from first LEO position.
-        x = float(self.leo_df.loc[0, 'LEO_x'])
-        y = float(self.leo_df.loc[0, 'LEO_y'])
-        vx = 0.0
-        vy = 0.0
-
-        previous_ts = float(self.acc_df.loc[0, 'timestamps'])
-        for i in range(n):
-            current_ts = float(self.acc_df.loc[i, 'timestamps'])
-            if i == 0:
-                dt = self.default_dt
-            else:
-                dt = current_ts - previous_ts
-                if not np.isfinite(dt) or dt <= 0.0:
-                    dt = self.default_dt
-
-            ax = float(self.acc_df.loc[i, 'ax'])
-            ay = float(self.acc_df.loc[i, 'ay'])
-
-            x = x + vx * dt + 0.5 * ax * dt ** 2
-            y = y + vy * dt + 0.5 * ay * dt ** 2
-            vx = vx + ax * dt
-            vy = vy + ay * dt
-
-            dr_df.loc[i, 'timestamps'] = current_ts
-            dr_df.loc[i, 'dr_x'] = x
-            dr_df.loc[i, 'dr_y'] = y
-            previous_ts = current_ts
-
-        return dr_df
 
 
 class ExtendedKalmanFilter2D:

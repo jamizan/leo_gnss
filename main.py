@@ -1,4 +1,4 @@
-from utils import csv_operations, dr_algorithm, ExtendedKalmanFilter2D
+from utils import csv_operations, ExtendedKalmanFilter2D
 from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
@@ -21,16 +21,6 @@ def apply_uniform_timestamps(df, dt=0.1):
     # Rebuild monotonic timestamps because source data contains repeated time values.
     out = df.copy()
     out['timestamps'] = np.arange(len(out), dtype=float) * dt
-    return out
-
-
-def debias_acceleration(acc_df):
-    out = acc_df.copy()
-    # Median is robust against spikes in IMU samples.
-    ax_bias = float(out['ax'].median())
-    ay_bias = float(out['ay'].median())
-    out['ax'] = out['ax'] - ax_bias
-    out['ay'] = out['ay'] - ay_bias
     return out
 
 
@@ -95,29 +85,18 @@ def tune_ekf(true_df, acc_df, leo_df, sample_size=3000):
     return best
 
 
-
-
 def main():
     filepath = Path(__file__).resolve().parent / 'dataset' / 'df_withLEO.csv'
     csv_op = csv_operations(filepath)
 
     true_df, acc_df, _, leo_df = csv_op.read_csv()
 
-    # Raw CSV timestamps are mostly duplicated; force a stable sample-time base.
     sample_dt = 0.1
     true_df = apply_uniform_timestamps(true_df, dt=sample_dt)
     acc_raw_df = apply_uniform_timestamps(acc_df, dt=sample_dt)
     leo_raw_df = apply_uniform_timestamps(leo_df, dt=sample_dt)
 
-    # DR uses raw (biased) IMU — shows unbounded drift without position correction.
-    dr_df = dr_algorithm(acc_raw_df, leo_raw_df, default_dt=sample_dt).calculate_df()
-
-    # Debias acceleration for EKF: IMU DC bias would otherwise accumulate in velocity
-    # and diverge the predicted state until LEO updates are rejected by the gate.
-    acc_ekf_df = debias_acceleration(acc_raw_df)
-
-    # EKF uses debiased IMU for prediction and LEO for measurement correction.
-    best = tune_ekf(true_df, acc_ekf_df, leo_raw_df)
+    best = tune_ekf(true_df, acc_raw_df, leo_raw_df)
 
     ekf = ExtendedKalmanFilter2D(
         process_accel_std=best['process_accel_std'],
@@ -129,49 +108,38 @@ def main():
         accel_gain=best['accel_gain'],
         accel_to_position=True
     )
-    ekf_df, rts_df = ekf.run(acc_ekf_df, leo_raw_df, compute_rts=True)
+    ekf_df, rts_df = ekf.run(acc_raw_df, leo_raw_df, compute_rts=True)
 
-    leo_rmse = position_rmse(true_df, leo_raw_df, 'true_x', 'true_y', 'LEO_x', 'LEO_y')
-    dr_rmse = position_rmse(true_df, dr_df, 'true_x', 'true_y', 'dr_x', 'dr_y')
-    ekf_rmse = position_rmse(true_df, ekf_df, 'true_x', 'true_y', 'ekf_x', 'ekf_y')
-    rts_rmse = position_rmse(true_df, rts_df, 'true_x', 'true_y', 'rts_x', 'rts_y')
+    
 
-    print(
-        'Best parameters:',
-        f"process_accel_std={best['process_accel_std']}",
-        f"measurement_pos_std={best['measurement_pos_std']}",
-        f"accel_gain={best['accel_gain']}",
-        f"gate_threshold={best['gate_threshold']}"
-    )
-    print(f"Tuning RMSE train/val: {best['train_rmse']:.3f} / {best['val_rmse']:.3f}")
-    print(f'RMSE LEO: {leo_rmse:.3f}')
-    print(f'RMSE DR: {dr_rmse:.3f}')
-    print(f'RMSE EKF: {ekf_rmse:.3f}')
-    print(f'RMSE RTS: {rts_rmse:.3f}')
+    def plot_trajectory_comparison(plot_n, filename):
 
-    plot_n = 500
-    true_plot = true_df.iloc[:plot_n]
-    leo_plot = leo_raw_df.iloc[:plot_n]
-    ekf_plot = ekf_df.iloc[:plot_n]
-    rts_plot = rts_df.iloc[:plot_n]
+        true_plot = true_df.iloc[:plot_n]
+        leo_plot = leo_raw_df.iloc[:plot_n]
+        ekf_plot = ekf_df.iloc[:plot_n]
+        rts_plot = rts_df.iloc[:plot_n]
 
-    plt.figure(figsize=(10, 8))
-    plt.plot(true_plot['true_x'], true_plot['true_y'], label='True', linewidth=2)
-    plt.plot(leo_plot['LEO_x'], leo_plot['LEO_y'], label='LEO', alpha=0.8)
-    plt.plot(ekf_plot['ekf_x'], ekf_plot['ekf_y'], label='Kalman (EKF)', linewidth=2)
-    plt.plot(rts_plot['rts_x'], rts_plot['rts_y'], label='RTS Smoothed', linewidth=2)
+        plt.figure(figsize=(10, 8))
+        plt.plot(true_plot['true_x'], true_plot['true_y'], label='True position', linewidth=2)
+        plt.plot(leo_plot['LEO_x'], leo_plot['LEO_y'], label='LEO', alpha=0.8)
+        plt.plot(ekf_plot['ekf_x'], ekf_plot['ekf_y'], label='EKF', linewidth=2)
+        plt.plot(rts_plot['rts_x'], rts_plot['rts_y'], label='RTS', linewidth=2)
 
-    plt.title('Trajectory Comparison: True vs LEO vs Kalman')
-    plt.xlabel('X position')
-    plt.ylabel('Y position')
-    plt.legend()
-    plt.grid(True, linestyle='--', alpha=0.4)
-    plt.axis('equal')
+        plt.title('Trajectory Comparison: True vs LEO vs EKF vs RTS')
+        plt.xlabel('X position')
+        plt.ylabel('Y position')
+        plt.legend()
+        plt.grid(True, linestyle='--', alpha=0.4)
+        plt.axis('equal')
 
-    plot_path = Path(__file__).resolve().parent / 'trajectory_comparison.png'
-    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
-    print(f'Plot saved to: {plot_path}')
+        plot_path = Path(__file__).resolve().parent / f'{filename}.png'
+        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+        print(f'Plot saved to: {plot_path}')
 
+    plot_trajectory_comparison(plot_n=200, filename='trajectory_comparison_200')
+    plot_trajectory_comparison(plot_n=500, filename='trajectory_comparison_500')
+    plot_trajectory_comparison(plot_n=1000, filename='trajectory_comparison_1000')
+    csv_op.create_csv(ekf_df, rts_df, output_filename='dataset/ekf_results.csv')
 
 if __name__ == "__main__":
     main()
